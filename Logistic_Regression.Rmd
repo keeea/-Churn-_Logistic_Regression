@@ -1,0 +1,456 @@
+---
+title: "Logistic Regression on Credit Takers"
+author: "Lan Xiao"
+date: "11/3/2021"
+output: 
+  html_document:
+    toc: yes
+    toc_float: TRUE
+    code_folding: hide
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, results = FALSE, message = FALSE)
+```
+
+## Motivation
+
+The home repair tax credit program is a program from the Department of Housing and Community Development (HCD), which has suffered from low conversion rate, typically only 11%, for decades. Not only did it waste many public resource when reaching out to ineligible owners who do not need this tax credit, but also it failed to improve the community environment. The main goal of this analytic is to help the HCD to target and reach out home owners who qualify for this program more promptly and precisely, improving home value of both repaired homes and those surrounding them. To be specific, an effective classifier will be trained, and its model results will assist to inform a cost/benefit analysis.
+
+```{r seting and loading}
+options(scipen=10000000)
+
+library(tidyverse)
+library(caret)
+library(knitr) 
+library(pscl)
+library(plotROC)
+library(pROC)
+library(scales)
+library(grid)
+library(kableExtra)
+library(cowplot)
+
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+palette5 <- c("#981FAC","#CB0F8B","#FF006A","#FE4C35","#FE9900")
+palette4 <- c("#981FAC","#FF006A","#FE4C35","#FE9900")
+palette2 <- c("#981FAC","#FF006A")
+
+housingSubsidy <- read.csv("data/housingSubsidy.csv") 
+housingSubsidy <- rename(housingSubsidy, c("unemploy_variation"="unemploy_rate")) %>% 
+  na.omit()
+```
+
+## Exploratory analysis
+
+First to explore useful features for prediction, plot association between variables and the likelihood of taking the credit.
+
+For continuous variables plot the mean of them by credit outcomes, and feature distributions grouped by outcomes. As shown below, there's no significant difference between two credit outcomes for age, money spent on repairs, no matter in the average values or distributions.
+
+```{r continuous Feature associations with the likelihood, fig.height=6}
+# convert "previous" column to category variable
+#housingSubsidy$previous <- as.character(housingSubsidy$previous)
+
+# list of all independent variables
+indpVars <- housingSubsidy %>% 
+  dplyr::select(-X, -y, -y_numeric) %>% 
+  names()  
+
+# list of numeric independent variables
+numericVars <- select_if(
+  housingSubsidy %>% dplyr::select(-X, -y, -y_numeric), 
+  is.numeric
+  ) %>% 
+  names()
+
+housingSubsidy %>%
+  dplyr::select(y, numericVars) %>%
+  gather(Variable, value, -y) %>%
+  ggplot(aes(y, value, fill=y)) + 
+    geom_bar(position = "dodge", stat = "summary", fun = "mean") + 
+    facet_wrap(~Variable, scales = "free", ncol = 3) +
+    scale_fill_manual(values = palette2) +
+    labs(x="Took the credit or not", y="Mean", 
+         title = "Feature associations with the likelihood of taking the credit",
+         subtitle = "(Continous outcomes)") +
+    plotTheme() + theme(legend.position = "none")
+```
+
+```{r exploratory_continuous_density, message = FALSE, warning = FALSE, fig.height=6}
+housingSubsidy %>% 
+    dplyr::select(y, numericVars) %>%
+    gather(Variable, value, -y) %>%
+    ggplot() + 
+    geom_density(aes(value, color=y), fill = "transparent") + 
+    facet_wrap(~Variable, scales = "free") +
+    scale_fill_manual(values = palette2) +
+    labs(title = "Feature distributions by the likelihood of taking the credit",
+         subtitle = "(continous outcomes)")# +
+   # theme(legend.position = "none")
+```
+
+For category variables, the best way to ecplore this association is to calculate the conversion rate for each subsector of each variable, i.e. how many people in this subsector chose to take the credit. The results show that for taxbill_in_phill and day_of_week there's no significant conversion rate difference between subcestors.
+
+```{r category Feature 1 associations with the likelihood, fig.height=4}
+# list of category independent variables
+categoryVars.1 <- housingSubsidy %>% 
+  dplyr::select(-X, -y, -y_numeric, -numericVars) %>% 
+  gather(Variable, value) %>% 
+  distinct() %>% 
+  group_by(Variable) %>% 
+  summarise(category = n()) %>% 
+  filter(category < 5)
+categoryVars.1 <- categoryVars.1$Variable
+
+housingSubsidy %>%
+  dplyr::select(y, categoryVars.1) %>%
+  gather(Variable, value, -y) %>%
+  count(Variable, value, y) %>%
+  group_by(Variable, value) %>% 
+  mutate(rate = n/sum(n)) %>% 
+  filter(y == 'yes') %>% 
+  ggplot(aes(value, rate)) +   
+    geom_bar(position = "dodge", stat="identity", fill="#981FAC") +
+    facet_wrap(~Variable, scales="free", ncol=3) +
+    labs(x="Took the credit or not", y="Conversion rate",
+         title = "Feature associations with the likelihood of taking the credit",
+         subtitle = "Category features") +
+    plotTheme() + theme(legend.position = "none")
+```
+
+```{r category Feature 2 associations with the likelihood, fig.height=5.5}
+# list of category independent variables
+categoryVars.2 <- housingSubsidy %>% 
+  dplyr::select(-X, -y, -y_numeric, -numericVars) %>% 
+  gather(Variable, value) %>%
+  distinct() %>% 
+  group_by(Variable) %>% 
+  summarise(category = n()) %>% 
+  filter(category > 4)
+categoryVars.2 <- categoryVars.2$Variable
+
+housingSubsidy %>%
+  dplyr::select(y, categoryVars.2) %>%
+  gather(Variable, value, -y) %>%
+  count(Variable, value, y) %>%
+  group_by(Variable, value) %>% 
+  mutate(rate = n/sum(n)) %>% 
+  filter(y == 'yes') %>% 
+  ggplot(aes(value, rate)) +   
+    geom_bar(position = "dodge", stat="identity", fill="#981FAC") +
+    facet_wrap(~Variable, scales="free", ncol=2) +
+    labs(x="Took the credit or not", y="Conversion rate",
+         title = "Feature associations with the likelihood of taking the credit",
+         subtitle = "Category features") +
+    plotTheme() + theme(axis.text.x = element_text(angle = 45, hjust = 1),legend.position = "none")
+```
+
+## Logistic regression
+
+### Training/Testing sets
+
+To begin estimating models, data sets are divided into two 65/35-training/test sets.
+
+```{r Training/Testing sets}
+set.seed(3458)
+trainIndex <- createDataPartition(y = paste(housingSubsidy$y,housingSubsidy$job,housingSubsidy$education), p = .65, list = FALSE, times = 1)
+Train <- housingSubsidy[ trainIndex,]
+Test  <- housingSubsidy[-trainIndex,]
+```
+
+### Estimate the first model
+
+Now, we use the binomial one from the general linear model family to estimate our first model with all our predictors.
+
+```{r Estimate the first model, results=TRUE}
+reg1 <- glm(y_numeric ~ .,
+                  data=Train %>% dplyr::select(-X, -y),
+                  family="binomial" (link="logit"))
+
+summary(reg1)
+```
+
+#### Goodness of Fit
+
+To evaluate the goodness of fit of the first model, apply the regression model we estimated toward the test data set to predict probabilities, classify any probability greater than 0.5 as predicted yes outcome, and then calculate confusing matrix and statistics.
+
+The Sensitivity (True Positive Rate) for the first model with all the features is very low, which means this model performs better on predicting those who are not going to take the credit. To improve the sensitivity of the model, further engineering for variables is needed.
+
+```{r test1 outcome}
+testProbs.1 <- data.frame(Outcome = as.factor(Test$y_numeric),
+                        Probs = predict(reg1, Test, type= "response"))
+```
+
+```{r predOutcome & confusionMatri for model1}
+testProbs.1 <- 
+  testProbs.1 %>%
+  mutate(predOutcome  = as.factor(ifelse(testProbs.1$Probs > 0.5 , 1, 0)))
+
+caret::confusionMatrix(testProbs.1$predOutcome, testProbs.1$Outcome, 
+                       positive = "1")
+```
+
+### Engineering new features
+
+Six features are engineered here: job, month, marital, mortgage, poutcome (Outcome of the previous marketing campaign), previous. The first five variables are category ones, and the engineering method for them is to reduce the classification based on exploratory analysis and regression significance. Take 'month' as an example, in the feature association plot, only December and March show significant differences in the credit conversion rate. Also, only the p-value of these two months are less than 0.05, which means these two months are significantly related to the outcome. So, for the month variable, we keep 'dec' and 'mar', while transforming any other values into 'other'. As for the continuous feature - previous, we transform it into 'never' when the value is 0, and transform it into 'ever' whenever it's bigger than 0. Because, its distribution clusters at 0 in the feature distribution plots.
+
+```{r Engineer new features }
+# engineer "job"
+housingSubsidy.engineered <- housingSubsidy %>% 
+  mutate(job = ifelse(housingSubsidy$job == "admin.", "admin.",
+                      ifelse(housingSubsidy$job == "blue-collar", "blue-collar","other")
+                      )
+         )
+
+# engineer "month"
+housingSubsidy.engineered <- housingSubsidy.engineered %>% 
+  mutate(month = ifelse(housingSubsidy.engineered$month == "dec", "dec",
+                      ifelse(housingSubsidy.engineered$month == "mar", "mar","aa-other")
+                      )
+         )
+
+# engineer "marital"
+housingSubsidy.engineered <- housingSubsidy.engineered %>% 
+  mutate(marital = ifelse(housingSubsidy.engineered$marital == "single", "single","other"))
+
+# engineer "mortgage"
+housingSubsidy.engineered <- housingSubsidy.engineered %>% 
+  mutate(mortgage = ifelse(housingSubsidy.engineered$mortgage == "unknown", "unknown","other"))
+
+# engineer "poutcome"
+housingSubsidy.engineered <- housingSubsidy.engineered %>% 
+  mutate(poutcome = ifelse(housingSubsidy.engineered$poutcome == "success", "success","other"))
+
+# engineer "previous"
+housingSubsidy.engineered <- housingSubsidy.engineered %>% 
+  mutate(previous = ifelse(housingSubsidy.engineered$previous == 0, "never","ever"))
+
+```
+
+### Estimate the engineered model
+
+After engineering six features, we will further remove 4 predictors that do not really matter according to association plots and p-value in the first model, and then estimate the the engineered model below. The AIC value has decreased, indicating that the second model is better fitted.
+
+```{r Estimate the Engineered model, results=TRUE}
+Train.2 <- housingSubsidy.engineered[ trainIndex,]
+Test.2  <- housingSubsidy.engineered[-trainIndex,]
+
+reg2 <- glm(y_numeric ~ .,
+            data=Train.2 %>% dplyr::select(-X, -y,-day_of_week,-education, -spent_on_repairs, -age,-taxbill_in_phl,),
+            family="binomial" (link="logit"))
+
+summary(reg2)
+```
+
+#### Goodness of Fit
+
+Predict the test data set with the engineered model, and calculate confusing matrix and statistics for the new model. As shown below, the sensitivity has increased a little. More adjustment for the threshold, which is arbitrarily 0.5 now, will further optimize this index.
+
+```{r test2 outcome}
+testProbs.2 <- data.frame(Outcome = as.factor(Test.2$y_numeric),
+                        Probs = predict(reg2, Test.2, type= "response"))
+head(testProbs.2)
+```
+
+```{r predOutcome & confusionMatri for model2}
+testProbs.2 <- 
+  testProbs.2 %>%
+  mutate(predOutcome  = as.factor(ifelse(testProbs.2$Probs > 0.5 , 1, 0)))
+
+caret::confusionMatrix(testProbs.2$predOutcome, testProbs.2$Outcome, 
+                       positive = "1")
+```
+
+## Cross-validation
+
+To evaluate the ability of two models to generalize on new data, create 100 folds, and regress cross-validation for both models, and plot histograms of the distribution of AUC, sensitivity and specificity for the 100 CV regression results. Considering that the tighter each distribution is to its mean the more generalizable the model, the engineered model generalize better with respect to sensitivity, although not generalize a little worse with respect to ROC.
+
+```{r Cross-validation for model1}
+# number:k, classProbs=TRUE: add a col of prob, summaryFunction=twoClassSummary: calculate sensitivity, specificity and ROC
+ctrl <- trainControl(method = "cv", number = 100, classProbs=TRUE, summaryFunction=twoClassSummary) 
+
+cvFit.1 <- train(y ~ ., data = housingSubsidy %>% 
+                   dplyr::select(-X,-y_numeric), 
+                 method="glm", family="binomial",
+                 metric="ROC", trControl = ctrl)
+
+cvFit.1
+
+```
+
+```{r Cross-validation for model2}
+cvFit.2 <- train(y ~ ., data = housingSubsidy %>% 
+                                   dplyr::select(
+                                   -X,
+                                   -y_numeric), 
+                method="glm", family="binomial",
+                metric="ROC", trControl = ctrl)
+
+cvFit.2
+
+```
+
+```{r CV Goodness of Fit Metrics,fig.height=5}
+p1 <- dplyr::select(cvFit.1$resample, -Resample) %>%  # including clos -  ROC Sens Spec
+  gather(metric, value) %>%
+  left_join(gather(cvFit.1$results[2:4], metric, mean)) %>%
+  ggplot(aes(value)) + 
+    geom_histogram(bins=35, fill = "#FF006A") +
+    facet_wrap(~metric) +
+    geom_vline(aes(xintercept = mean), colour = "#981FAC", linetype = 3, size = 1.5) +
+    scale_x_continuous(limits = c(0, 1)) +
+    scale_y_continuous(limits = c(0, 40)) +
+    labs(x="Goodness of Fit", y="Count", title="CV Goodness of Fit Metrics for the Kitchen Sink Regression",
+         subtitle = "Across-fold mean reprented as dotted lines") +
+    plotTheme()
+
+p2 <- dplyr::select(cvFit.2$resample, -Resample) %>%  # including clos -  ROC Sens Spec
+  gather(metric, value) %>%
+  left_join(gather(cvFit.2$results[2:4], metric, mean)) %>%
+  ggplot(aes(value)) + 
+    geom_histogram(bins=35, fill = "#FF006A") +
+    facet_wrap(~metric) +
+    geom_vline(aes(xintercept = mean), colour = "#981FAC", linetype = 3, size = 1.5) +
+    scale_x_continuous(limits = c(0, 1)) +
+    scale_y_continuous(limits = c(0, 40)) +
+    labs(x="Goodness of Fit", y="Count", title="CV Goodness of Fit Metrics for the Engineered Regression",
+         subtitle = "Across-fold mean reprented as dotted lines") +
+    plotTheme()
+
+cowplot::plot_grid(p1, p2, nrow = 2)
+```
+
+## ROC Curve
+
+Plot the Receiver Operating Characteristic Curve (ROC Curve), which visualizes trade-offs for true positive rate and false positive rate. The gray dialogue line is known as "coin flip line" where any true positive rate has an equal corresponding false positive rate. The ROC curve for the engineered model is above the hich visualizes trade-offs for true positive rate and false positive rate. The gray dialogue line is known as "coin flip line", which indicates that it's a useful model better than coin flips.
+
+```{r Roc Curves for model2}
+# d:decision, m:measurement
+ggplot(testProbs.2, aes(d = as.numeric(testProbs.1$Outcome), m = Probs)) + 
+  # n.cutoff: show how many cutoff, labels :show the value of cutoffs
+  geom_roc(n.cuts = 50, labels = FALSE, colour = "#FE9900") +
+  # add guides and annotations to a ROC plot
+  style_roc(theme = theme_grey) +
+  # add a slope
+  geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'grey') +
+  labs(title = "ROC Curve - the first model")
+```
+
+## Generating costs and benefits
+
+To put the algorithm into production, the prediction need to be improved by searching for an optimal threshold. First, calculate the cost/benefit for each outcome in th confusion matrix, like so:
+
+-   **True Positive Revenue** - Predicted correctly homeowner would take the credit: \$10,000 + \$56,000 - \$2,850 - \$5,000= **\$58,150** return for 25% of cases that took the credit. **- \$2,850** lose for 75% of cases who took the credit first but failed to complete it.
+
+-   **True Negative Revenue** - Predicted correctly homeowner would not take the credit, no marketing resources were allocated, and no credit was allocated: **\$0**
+
+-   **False Positive Revenue** - Predicted incorrectly homeowner would take the credit; allocated marketing resources; no credit allocated: **- \$2,850**
+
+-   **False Negative Revenue** - We predicted that a homeowner would not take the credit but they did. These are likely homeowners who signed up for reasons unrelated to the marketing campaign: **\$0**
+
+Second, calculate confusing metric for 100 threshold form 0.01 to 1. Third, calculate revenue for each confusing metric at each threshold, and then calculate the total revenue for each threshold. Assuming the algorithm with 50% threshold was used, the total Revenue (column sum) in the Cost/Benefit Table below is \$56,300.
+
+```{r Cost/Benefit Table, results=TRUE}
+cost_benefit_table <-
+   testProbs.2%>%
+      count(predOutcome, Outcome) %>%
+      summarize(True_Negative = sum(n[predOutcome==0 & Outcome==0]),
+                True_Positive = sum(n[predOutcome==1 & Outcome==1]),
+                False_Negative = sum(n[predOutcome==0 & Outcome==1]),
+                False_Positive = sum(n[predOutcome==1 & Outcome==0])) %>%
+       gather(Variable, Count) %>%
+       mutate(Revenue =
+               case_when(Variable == "True_Negative"  ~ Count * 0,
+                         Variable == "True_Positive"  ~ Count * 0.25 * 25150 - Count * 0.75 * 2850,
+                         Variable == "False_Negative" ~Count * 0,
+                         Variable == "False_Positive" ~ Count * (-2580))
+              ) %>%
+    bind_cols(data.frame(Description = c(
+              "We predicted correctly homeowner would not take the credit, no marketing resources were allocated, and no credit was allocated.",
+              "We predicted correctly homeowner would take the credit, allocated the marketing resources, and 25% complete the credit.",
+              "We predicted that a homeowner would not take the credit but they did for reasons unrelated to the marketing campaign.",
+              "We predicted incorrectly homeowner would take the credit; allocated marketing resources; no credit allocated."))) 
+
+cost_benefit_table %>% 
+      kable(caption = "Cost/Benefit Table") %>%
+      kable_styling("striped", full_width = F)
+
+```
+
+### Optimizing the cost/benefit relationship
+
+Plot the revenue of each confusing metric by each threshold.
+
+```{r Revenue by confusion matrix type and threshold}
+whichThreshold <- 
+  iterateThresholds(
+     data=testProbs.2, observedClass = Outcome, predictedProbs = Probs)
+
+whichThreshold <- 
+  whichThreshold %>%
+    dplyr::select(starts_with("Count"), Threshold) %>%
+    gather(Variable, Count, -Threshold) %>%
+    mutate(Revenue =
+               case_when(Variable == "Count_TN"  ~ Count * 0,
+                         Variable == "Count_TP"  ~ Count * 0.25 * 25150 - Count * 0.75 * 2850,
+                         Variable == "Count_FN" ~ Count * 0,
+                         Variable == "Count_FP" ~ Count * (-2580)))
+
+whichThreshold %>%
+  ggplot(.,aes(Threshold, Revenue, colour = Variable)) +
+  geom_point() +
+  scale_colour_manual(values = palette5[c(5, 1:3)], name = "Confusion Matrix") +    
+  labs(title = "Revenue by confusion matrix type and threshold",
+       y = "Revenue") +
+  plotTheme() 
+```
+
+Plot to show Threshold as a function of Total_Revenue and Total_Count_of_Credits. Assuming the test set is the universe of potential homeowners, the optimal threshold is the one that returns the greatest revenue in the plot - 40%. After that mark, the total revenue begin to slightly decline. Although the total count of people who taken credits still increase, the increase results from negative false population who signed up for reasons unrelated to the marketing campaign.
+
+```{r Threshold as a function of Total_Revenue and Total_Count_of_Credits}
+whichThreshold_revenue <- 
+  whichThreshold %>% 
+    mutate(Total_Count_of_Credits = ifelse(Variable == "Count_TP", (Count * .25),
+                                 ifelse(Variable == "Count_FN", Count, 0))) %>% 
+    group_by(Threshold) %>% 
+    summarize(Total_Revenue = sum(Revenue),
+              Total_Credits_Rate = sum(Total_Count_of_Credits) / sum(Count),
+              Total_Count_of_Credits = sum(Total_Count_of_Credits)) 
+
+whichThreshold_revenue %>%
+  dplyr::select(Threshold, Total_Revenue, Total_Count_of_Credits) %>%
+  gather(Variable, Value, -Threshold) %>%
+  ggplot(aes(Value, Threshold, colour = Variable)) +
+    geom_point() +
+    geom_hline(yintercept = pull(arrange(whichThreshold_revenue, -Total_Revenue)[1,1])) +
+    scale_colour_manual(values = palette2) +
+    facet_wrap(~Variable, scale = "free") +
+    plotTheme() +
+    labs(title = "Threshold by revenue and number of taken credits",
+         subtitle = "Horizontal line denotes optimal threshold by revenue")
+```
+
+Table below shows the count of people who taken credits and total revenue for the 50%-threshold model and the optimal threshold one. The final optimal model has significantly improved the total revenue the society can benefit from.
+
+```{r Create a table of the Total_Revenue and Total_Count_of_Credits allocated for 2 categories, results=TRUE }
+optimal_threshod = pull(arrange(whichThreshold_revenue, -Total_Revenue)[1,1])
+
+whichThreshold_revenue %>% 
+  filter(Threshold == .5 | Threshold == optimal_threshod) %>% 
+  dplyr::select(Total_Revenue, Total_Count_of_Credits) %>% 
+  cbind(data.frame(Model = c("OptimalThreshold", "50% Threshold")),.) %>% 
+  kable() %>%
+  kable_styling("striped", full_width = F)
+```
+
+## Conclusion
+
+This model should be put into production. Because, it will contribute to improve the outcomes relative to the business-as-usual approach of the Department of Housing and Community Development. For the optimal model with 36 true positive cases and 32 false negative cases, its conversion rate is 36 / (36+32) = **53%,** which is much higher than the business-as-usual rate 11%.
+
+However, the final model still performs much better on predict people who didn't take the credit than those who taken it, which means our would-be decision-making tool is inconsistent in how it predicts the desired outcome, homeowners who will take credits. To improve this, more data of homeowners who took credits are needed. In other words, a higher proportion of positive results in the previous data will help to make our model better.
+
+In the future, we will explore the relationship between response rate and different marketing materials by various population groups. So the HCD can apply different specifically-targeted marketing methods to people with various characteristic, such as age, job and previous event records, to increase the response rate.
